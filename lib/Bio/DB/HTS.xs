@@ -56,6 +56,8 @@ limitations under the License.
 #include "synced_bcf_reader.h"
 #include <zlib.h>
 
+#define BGZF_CACHE
+
 /* stolen from bam_aux.c */
 #define BAM_MAX_REGION 1<<29
 
@@ -72,12 +74,27 @@ typedef bcf_hdr_t*      Bio__DB__HTS__VCF__Header;
 typedef bcf_hdr_t*      Bio__DB__HTS__VCF__HeaderPtr;
 typedef bcf1_t*         Bio__DB__HTS__VCF__Row;
 typedef bcf1_t*         Bio__DB__HTS__VCF__RowPtr;
-KSEQ_INIT(gzFile, gzread)
-typedef gzFile          Bio__DB__HTS__Kseq;
+KSEQ_INIT(BGZF*, bgzf_read)
+typedef BGZF*           Bio__DB__HTS__Kseq;
 typedef kseq_t*         Bio__DB__HTS__Kseq__Iterator;
 typedef kstream_t*      Bio__DB__HTS__Kseq__Kstream;
 typedef kstring_t*      Bio__DB__HTS__Kseq__Kstring;
 typedef bcf_sweep_t*    Bio__DB__HTS__VCF__Sweep;
+
+/* next three structs are stolen from bgzf.c private structs :( */
+typedef struct {
+  uint64_t uaddr;  // offset w.r.t. uncompressed data
+  uint64_t caddr;  // offset w.r.t. compressed data
+} bgzidx1_t;
+
+struct __bgzidx_t {
+  int noffs, moffs;       // the size of the index, n=used, m=allocated
+  bgzidx1_t *offs;        // offsets
+  uint64_t ublock_addr;   // offset of the current block (uncompressed data)
+};
+#ifdef BGZF_CACHE
+struct bgzf_cache_t { void *h; };
+#endif
 
 typedef struct {
   SV* callback;
@@ -359,6 +376,89 @@ int hts_fetch(htsFile *fp, const hts_idx_t *idx, int tid, int beg, int end, void
     return (ret == -1)? 0 : ret;
 }
 
+/*
+ * get uncompressed size from a BGZF file
+ */
+uint64_t bgzf_uncompressed_size(BGZF* fp)
+{
+  uint64_t size, caddr, uaddr, curpos;
+  BGZF *clone;
+  int i; // last block index pos
+
+  /*
+   * sanity checks
+   * */
+  if (fp->is_compressed == 0)
+  {
+    return -1;
+  }
+  if (fp->idx == NULL)
+  {
+    return -1;
+  }
+  if(fp->last_block_eof == 1)
+  {
+    /* short cut and assume read */
+    return fp->uncompressed_address;
+  }
+
+  curpos = htell(fp->fp);
+  i      = fp->idx->noffs - 1;
+  caddr  = fp->idx->offs[i].caddr;
+  uaddr  = fp->idx->offs[i].uaddr;
+
+  /*
+   * create a clone BGZF to fill in data with
+   * */
+  if ((clone = bgzf_hopen(fp->fp, "r")) == NULL)
+  {
+    return -1;
+  }
+  /* do not add to any cache in this clone for more simple cleanup */
+  bgzf_set_cache_size(clone, 0);
+
+  if (hseek(fp->fp, caddr, SEEK_SET) < 0)
+  {
+    clone->errcode |= BGZF_ERR_IO;
+    return -1;
+  }
+
+  clone->block_length  = 0;  // indicates current block has not been loaded
+  clone->block_address = caddr;
+  clone->block_offset  = 0;
+
+  /*
+   * read the last block to ascertain its length and record
+   */
+  if ( bgzf_read_block(clone) < 0 )
+  {
+    clone->errcode |= BGZF_ERR_IO;
+    return -1;
+  }
+  size = uaddr + clone->block_length;
+
+  /*
+   * seek back to original position
+   */
+  if (hseek(fp->fp, curpos, SEEK_SET) < 0)
+  {
+    clone->errcode |= BGZF_ERR_IO;
+    return -1;
+  }
+
+  /*
+   * cleanup as required.
+   */
+#ifdef BGZF_CACHE
+  free(clone->cache->h);
+  free(clone->cache);
+#endif
+  clone->fp = NULL;
+  free(clone->uncompressed_block);
+  free(clone);
+
+  return size;
+}
 
 MODULE = Bio::DB::HTS PACKAGE = Bio::DB::HTS::Fai PREFIX=fai_
 
@@ -2017,7 +2117,7 @@ kseq_new(package, filename, mode="r")
   char *mode
   PROTOTYPE: $$$
   CODE:
-      RETVAL = gzopen(filename, mode);
+      RETVAL = bgzf_open(filename, mode);
   OUTPUT:
       RETVAL
 
@@ -2028,7 +2128,66 @@ kseq_newfh(pack, fh, mode="r")
   char *mode
   PROTOTYPE: $$$
   CODE:
-      RETVAL = gzdopen(PerlIO_fileno(fh), mode);
+      RETVAL = bgzf_dopen(PerlIO_fileno(fh), mode);
+  OUTPUT:
+      RETVAL
+
+int
+kseq_index_load(fp, filename)
+  Bio::DB::HTS::Kseq fp
+  char *filename
+  PROTOTYPE: $$
+  CODE:
+      RETVAL = bgzf_index_load(fp, filename, NULL);
+  OUTPUT:
+      RETVAL
+
+int
+kseq_utell(fp)
+  Bio::DB::HTS::Kseq fp
+  PROTOTYPE: $
+  CODE:
+      RETVAL = bgzf_utell(fp);
+  OUTPUT:
+      RETVAL
+
+int
+kseq_uncompressed_size(fp)
+  Bio::DB::HTS::Kseq fp
+  PROTOTYPE: $
+  CODE:
+      RETVAL = bgzf_uncompressed_size(fp);
+  OUTPUT:
+    RETVAL
+
+int
+kseq_useek(fp, uoffset)
+  Bio::DB::HTS::Kseq fp
+  int uoffset
+  PROTOTYPE: $$
+  CODE:
+      RETVAL = bgzf_useek(fp, uoffset, 0);
+  OUTPUT:
+      RETVAL
+
+int
+kseq_print_index(fp)
+  Bio::DB::HTS::Kseq fp
+  PROTOTYPE: $
+  CODE:
+       if (fp->idx == NULL) {
+
+       } else {
+         fprintf(stderr, "offsets = %lld\n", fp->idx->noffs);
+         int i;
+         for (i=0; i<fp->idx->noffs; i++)
+         {
+           fprintf(stderr, "cadddr = %lld, uaddr = %lld\n",
+                   fp->idx->offs[i].caddr,
+                   fp->idx->offs[i].uaddr);
+         }
+       }
+      RETVAL = 0;
   OUTPUT:
       RETVAL
 
@@ -2046,7 +2205,7 @@ kseq_DESTROY(fp)
   Bio::DB::HTS::Kseq fp
   PROTOTYPE: $
   CODE:
-      gzclose(fp);
+      bgzf_close(fp);
 
 MODULE = Bio::DB::HTS PACKAGE = Bio::DB::HTS::Kseq::Kstream   PREFIX=kstream_
 
@@ -2178,7 +2337,25 @@ kseqit_rewind(it)
         just resets markers */
       kseq_rewind(it);
       /* use zlib to do so */
-      gzrewind(it->f->f);
+      bgzf_seek(it->f->f, 0, 0);
+
+int
+kseqit_useek(it, offset)
+  Bio::DB::HTS::Kseq::Iterator it
+  int offset
+  PROTOTYPE: $$
+  INIT:
+    int useek;
+  CODE:
+      if ((useek = bgzf_useek(it->f->f, offset, 0)) == 0) {
+        kseq_rewind(it);
+        RETVAL = useek;
+      } else {
+        RETVAL = -1;
+      }
+  OUTPUT:
+      RETVAL
+
 
 Bio::DB::HTS::Kseq::Kstream
 kseqit_kstream(it)

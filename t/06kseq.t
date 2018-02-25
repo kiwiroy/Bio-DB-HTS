@@ -13,7 +13,7 @@
 # limitations under the License.
 use strict;
 use warnings;
-
+use File::Spec::Functions qw{catfile};
 use FindBin '$Bin';
 use lib "$Bin/../lib", "$Bin/../blib/lib", "$Bin/../blib/arch", "$Bin/../t";
 
@@ -204,6 +204,7 @@ for my $example (sort keys %example_files) {
     my $target= "$example.fastq";
     my $file = File::Spec->catfile($Bin, 'kseq_data', $target);
     my $kseq = Bio::DB::HTS::Kseq->new($file);
+    is $kseq->uncompressed_size, -1, 'not compressed';
     SKIP: {
       skip 'Cannot go further. No kseq file found for '.$target, 8 if ! defined $kseq;
       my $it = $kseq->iterator;
@@ -226,5 +227,109 @@ for my $example (sort keys %example_files) {
       }
     }
 }
+
+sub bgzip_indexed_files_ok {
+    my ($dir, $tests) = @_;
+
+    for my $key(keys %$tests) {
+        subtest "file = $key" => sub {
+            my $file = catfile $dir, $key;
+            my $kseq = new_ok('Bio::DB::HTS::Kseq', [$file]);
+            my $idx_exp = (-e "$file.gzi" ? 0 : -1);
+            is $kseq->index_load("$file.gzi"), $idx_exp, 'index load';
+
+            my $size = (-s $file);
+
+            $tests->{$key}->($kseq, $size);
+        };
+    }
+    return 0;
+}
+
+sub iterator_useek_ok {
+    my ($itr, %seeks) = @_;
+
+    ## keys randomises tests
+    for my $pos(keys %seeks) {
+        my $name_or_func = $seeks{$pos};
+        my $ref = ref($name_or_func);
+
+        if ($ref eq 'CODE') {
+            subtest "pos = $pos" => sub { $name_or_func->($itr, $pos) };
+        } else {
+            is $itr->useek($pos), 0, "seek($pos) success";
+            my $seq = $itr->next_seq;
+            is $seq->name, $seeks{$pos}, "name at $pos";
+        }
+    }
+}
+
+bgzip_indexed_files_ok 't/data', {
+    'dm3_3R_4766911_4767130.fastq.gz' => sub {
+        my ($kseq, $size, $itr, $seq) = (shift, shift);
+
+        $itr = $kseq->iterator;
+        $seq = $itr->next_seq;
+        is $seq->name, 'SNPSTER1_0624:1:76:3859:1170#0/1', 'name of first sequence';
+
+        $seq = $itr->next_seq;
+        is $seq->name, 'SNPSTER1_0624:1:19:3314:1450#0/1', 'name of second sequence';
+
+        #$kseq->print_index;
+
+        iterator_useek_ok $itr, (
+            118  => 'SNPSTER1_0624:1:19:3314:1450#0/1',
+            833  => 'SNPSTER1_0624:1:76:11608:14484#0/1',
+            8814 => 'SNPSTER1_0624:1:113:19575:18309#0/1',
+            'complex'  => sub {
+                my ($itr, $s) = (shift);
+
+                $itr->useek(118);
+
+                $s = $itr->next_seq;
+                is $s->name, 'SNPSTER1_0624:1:19:3314:1450#0/1', 'correct seek';
+
+                is $kseq->uncompressed_size, 8935, 'uncompressed';
+
+                $s = $itr->next_seq;
+                is $s->name, 'SNPSTER1_0624:1:24:11178:5138#0/1', 'read correct next seq';
+
+                is $kseq->uncompressed_size, 8935, 'uncompressed';
+
+                $s = $itr->next_seq;
+                is $s->name, 'SNPSTER1_0624:1:59:18561:8672#0/1', 'read correct next seq';
+            }
+        );
+    },
+    'ex1.fastq.gz' => sub {
+        my ($kseq, $size) = @_;
+
+        is $kseq->uncompressed_size, 330686, 'bigger file';
+
+        my $itr = $kseq->iterator;
+        my $seq = $itr->next_seq;
+
+        is $seq->name, 'B7_591:4:96:693:509/1', 'first';
+
+        is $kseq->uncompressed_size, 330686, 'bigger file';
+
+        iterator_useek_ok $itr, (
+            327625 => 'EAS1_105:3:7:35:528/1',
+            327024 => 'EAS114_28:6:11:151:750/2',
+            18221  => 'B7_589:7:112:203:90/2',
+            uncompressed_size => sub {
+                is $kseq->uncompressed_size, 330686, 'bigger file';
+            },
+            no_change => sub {
+                $kseq->useek(326400);
+                my $s = $itr->next_seq;
+                is $kseq->uncompressed_size, 330686, 'bigger file';
+            }
+        );
+
+        # $kseq->print_index;
+        #diag "ex1.fastq.gz = ", $kseq->utell;
+    }
+};
 
 done_testing();
